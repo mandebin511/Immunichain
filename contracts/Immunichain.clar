@@ -169,3 +169,299 @@
     (match (map-get? vaccination-records token-id)
       record (get verified record)
       false)))
+
+(define-constant err-schedule-not-found (err u109))
+(define-constant err-organization-not-found (err u110))
+(define-constant err-invalid-schedule-data (err u111))
+(define-constant err-compliance-rule-exists (err u112))
+(define-constant err-reminder-not-found (err u113))
+
+(define-data-var next-schedule-id uint u1)
+(define-data-var next-organization-id uint u1)
+(define-data-var next-reminder-id uint u1)
+
+(define-map vaccination-schedules uint
+  (tuple
+    (vaccine-name (string-ascii 128))
+    (total-doses uint)
+    (interval-days uint)
+    (reminder-days-before uint)
+    (validity-period-days uint)
+    (created-by principal)
+    (active bool)
+  ))
+
+(define-map organizations uint
+  (tuple
+    (name (string-ascii 256))
+    (admin principal)
+    (compliance-officer principal)
+    (active bool)
+    (created-at uint)
+  ))
+
+(define-map compliance-rules (tuple (organization-id uint) (vaccine-name (string-ascii 128)))
+  (tuple
+    (required bool)
+    (grace-period-days uint)
+    (reminder-frequency-days uint)
+    (updated-at uint)
+  ))
+
+(define-map patient-compliance (tuple (patient-id (string-ascii 64)) (organization-id uint))
+  (tuple
+    (compliance-status bool)
+    (last-checked uint)
+    (next-due-date (optional uint))
+    (pending-vaccines (list 10 (string-ascii 128)))
+  ))
+
+(define-map vaccination-reminders uint
+  (tuple
+    (patient-id (string-ascii 64))
+    (vaccine-name (string-ascii 128))
+    (due-date uint)
+    (reminder-date uint)
+    (organization-id (optional uint))
+    (status (string-ascii 32))
+    (created-at uint)
+  ))
+
+(define-map organization-members (tuple (organization-id uint) (patient-id (string-ascii 64))) bool)
+(define-map patient-organizations (string-ascii 64) (list 20 uint))
+
+(define-public (create-vaccination-schedule
+  (vaccine-name (string-ascii 128))
+  (total-doses uint)
+  (interval-days uint)
+  (reminder-days-before uint)
+  (validity-period-days uint))
+  (let ((schedule-id (var-get next-schedule-id)))
+    (asserts! (or (is-eq tx-sender contract-owner) 
+                  (default-to false (map-get? authorized-issuers tx-sender))) err-unauthorized-issuer)
+    (asserts! (> (len vaccine-name) u0) err-invalid-schedule-data)
+    (asserts! (> total-doses u0) err-invalid-schedule-data)
+    (asserts! (> interval-days u0) err-invalid-schedule-data)
+    (map-set vaccination-schedules schedule-id
+      (tuple
+        (vaccine-name vaccine-name)
+        (total-doses total-doses)
+        (interval-days interval-days)
+        (reminder-days-before reminder-days-before)
+        (validity-period-days validity-period-days)
+        (created-by tx-sender)
+        (active true)
+      ))
+    (var-set next-schedule-id (+ schedule-id u1))
+    (ok schedule-id)))
+
+(define-public (update-vaccination-schedule
+  (schedule-id uint)
+  (total-doses uint)
+  (interval-days uint)
+  (reminder-days-before uint)
+  (validity-period-days uint)
+  (active bool))
+  (let ((schedule (unwrap! (map-get? vaccination-schedules schedule-id) err-schedule-not-found)))
+    (asserts! (or (is-eq tx-sender contract-owner)
+                  (is-eq tx-sender (get created-by schedule))) err-owner-only)
+    (map-set vaccination-schedules schedule-id
+      (merge schedule
+        (tuple
+          (total-doses total-doses)
+          (interval-days interval-days)
+          (reminder-days-before reminder-days-before)
+          (validity-period-days validity-period-days)
+          (active active)
+        )))
+    (ok true)))
+
+(define-public (register-organization
+  (name (string-ascii 256))
+  (admin principal)
+  (compliance-officer principal))
+  (let ((org-id (var-get next-organization-id)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> (len name) u0) err-invalid-vaccine-data)
+    (map-set organizations org-id
+      (tuple
+        (name name)
+        (admin admin)
+        (compliance-officer compliance-officer)
+        (active true)
+        (created-at stacks-block-height)
+      ))
+    (var-set next-organization-id (+ org-id u1))
+    (ok org-id)))
+
+(define-public (add-compliance-rule
+  (organization-id uint)
+  (vaccine-name (string-ascii 128))
+  (required bool)
+  (grace-period-days uint)
+  (reminder-frequency-days uint))
+  (let ((org (unwrap! (map-get? organizations organization-id) err-organization-not-found)))
+    (asserts! (or (is-eq tx-sender (get admin org))
+                  (is-eq tx-sender (get compliance-officer org))
+                  (is-eq tx-sender contract-owner)) err-owner-only)
+    (map-set compliance-rules (tuple (organization-id organization-id) (vaccine-name vaccine-name))
+      (tuple
+        (required required)
+        (grace-period-days grace-period-days)
+        (reminder-frequency-days reminder-frequency-days)
+        (updated-at stacks-block-height)
+      ))
+    (ok true)))
+
+(define-public (enroll-patient-in-organization
+  (patient-id (string-ascii 64))
+  (organization-id uint))
+  (let ((org (unwrap! (map-get? organizations organization-id) err-organization-not-found))
+        (current-orgs (default-to (list) (map-get? patient-organizations patient-id))))
+    (asserts! (or (is-eq tx-sender (get admin org))
+                  (is-eq tx-sender (get compliance-officer org))
+                  (is-eq tx-sender contract-owner)) err-owner-only)
+    (map-set organization-members (tuple (organization-id organization-id) (patient-id patient-id)) true)
+    (map-set patient-organizations patient-id 
+      (unwrap! (as-max-len? (append current-orgs organization-id) u20) err-invalid-vaccine-data))
+    (map-set patient-compliance (tuple (patient-id patient-id) (organization-id organization-id))
+      (tuple
+        (compliance-status false)
+        (last-checked u0)
+        (next-due-date none)
+        (pending-vaccines (list))
+      ))
+    (ok true)))
+
+(define-public (create-vaccination-reminder
+  (patient-id (string-ascii 64))
+  (vaccine-name (string-ascii 128))
+  (due-date uint)
+  (organization-id (optional uint)))
+  (let ((reminder-id (var-get next-reminder-id)))
+    (asserts! (or (is-eq tx-sender contract-owner)
+                  (default-to false (map-get? authorized-issuers tx-sender))) err-unauthorized-issuer)
+    (asserts! (> due-date stacks-block-height) err-invalid-vaccine-data)
+    (map-set vaccination-reminders reminder-id
+      (tuple
+        (patient-id patient-id)
+        (vaccine-name vaccine-name)
+        (due-date due-date)
+        (reminder-date (- due-date u7))
+        (organization-id organization-id)
+        (status "pending")
+        (created-at stacks-block-height)
+      ))
+    (var-set next-reminder-id (+ reminder-id u1))
+    (ok reminder-id)))
+
+(define-public (update-reminder-status
+  (reminder-id uint)
+  (new-status (string-ascii 32)))
+  (let ((reminder (unwrap! (map-get? vaccination-reminders reminder-id) err-reminder-not-found)))
+    (asserts! (or (is-eq tx-sender contract-owner)
+                  (default-to false (map-get? authorized-issuers tx-sender))) err-unauthorized-issuer)
+    (map-set vaccination-reminders reminder-id
+      (merge reminder (tuple (status new-status))))
+    (ok true)))
+
+(define-public (check-compliance-status
+  (patient-id (string-ascii 64))
+  (organization-id uint))
+  (let ((org (unwrap! (map-get? organizations organization-id) err-organization-not-found))
+        (patient-record-ids (default-to (list) (map-get? patient-records patient-id)))
+        (compliance-data (default-to 
+          (tuple (compliance-status false) (last-checked u0) (next-due-date none) (pending-vaccines (list)))
+          (map-get? patient-compliance (tuple (patient-id patient-id) (organization-id organization-id))))))
+    (asserts! (or (is-eq tx-sender (get admin org))
+                  (is-eq tx-sender (get compliance-officer org))
+                  (is-eq tx-sender contract-owner)) err-owner-only)
+    (let ((updated-compliance (calculate-compliance-status patient-record-ids organization-id)))
+      (map-set patient-compliance (tuple (patient-id patient-id) (organization-id organization-id))
+        (merge compliance-data
+          (tuple
+            (compliance-status (get compliance-status updated-compliance))
+            (last-checked stacks-block-height)
+            (next-due-date (get next-due-date updated-compliance))
+            (pending-vaccines (get pending-vaccines updated-compliance))
+          )))
+      (ok updated-compliance))))
+
+(define-private (calculate-compliance-status (record-ids (list 50 uint)) (organization-id uint))
+  (fold process-compliance-record record-ids 
+    (tuple (compliance-status true) (next-due-date none) (pending-vaccines (list)))))
+
+(define-private (process-compliance-record 
+  (token-id uint) 
+  (acc (tuple (compliance-status bool) (next-due-date (optional uint)) (pending-vaccines (list 10 (string-ascii 128))))))
+  (match (map-get? vaccination-records token-id)
+    record (let ((vaccine-name (get vaccine-name record))
+                 (next-dose-due (get next-dose-due record)))
+             (if (and (is-some next-dose-due) (< (unwrap-panic next-dose-due) stacks-block-height))
+               (tuple 
+               (compliance-status false)
+               (next-due-date (some (unwrap-panic next-dose-due)))
+               (pending-vaccines (default-to (get pending-vaccines acc) 
+                  (as-max-len? (append (get pending-vaccines acc) vaccine-name) u10))))
+               acc))
+    acc))
+
+(define-read-only (get-vaccination-schedule (schedule-id uint))
+  (map-get? vaccination-schedules schedule-id))
+
+(define-read-only (get-organization (organization-id uint))
+  (map-get? organizations organization-id))
+
+(define-read-only (get-compliance-rule (organization-id uint) (vaccine-name (string-ascii 128)))
+  (map-get? compliance-rules (tuple (organization-id organization-id) (vaccine-name vaccine-name))))
+
+(define-read-only (get-patient-compliance (patient-id (string-ascii 64)) (organization-id uint))
+  (map-get? patient-compliance (tuple (patient-id patient-id) (organization-id organization-id))))
+
+(define-read-only (get-vaccination-reminder (reminder-id uint))
+  (map-get? vaccination-reminders reminder-id))
+
+(define-read-only (get-patient-organizations (patient-id (string-ascii 64)))
+  (map-get? patient-organizations patient-id))
+
+(define-read-only (get-pending-reminders (current-block uint))
+  (let ((all-reminders (map get-vaccination-reminder (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))))
+    (filter is-reminder-due all-reminders)))
+
+(define-private (is-reminder-due (reminder-opt (optional (tuple 
+  (patient-id (string-ascii 64))
+  (vaccine-name (string-ascii 128))
+  (due-date uint)
+  (reminder-date uint)
+  (organization-id (optional uint))
+  (status (string-ascii 32))
+  (created-at uint)))))
+  (match reminder-opt
+    reminder (and (<= (get reminder-date reminder) stacks-block-height)
+                  (is-eq (get status reminder) "pending"))
+    false))
+
+(define-read-only (get-organization-compliance-summary (organization-id uint))
+  (let ((org (unwrap! (map-get? organizations organization-id) (err u404))))
+    (ok (tuple
+      (organization-name (get name org))
+      (total-members u0)
+      (compliant-members u0)
+      (pending-vaccinations u0)
+      (overdue-vaccinations u0)
+    ))))
+
+(define-read-only (get-next-vaccination-due (patient-id (string-ascii 64)))
+  (let ((record-ids (default-to (list) (map-get? patient-records patient-id))))
+    (fold find-earliest-due-date record-ids none)))
+
+(define-private (find-earliest-due-date (token-id uint) (earliest (optional uint)))
+  (match (map-get? vaccination-records token-id)
+    record (match (get next-dose-due record)
+             due-date (match earliest
+                        current-earliest (if (< due-date current-earliest)
+                                           (some due-date)
+                                           earliest)
+                        (some due-date))
+             earliest)
+    earliest))
