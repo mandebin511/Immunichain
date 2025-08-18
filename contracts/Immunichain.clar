@@ -465,3 +465,272 @@
                         (some due-date))
              earliest)
     earliest))
+
+(define-constant err-certificate-not-found (err u114))
+(define-constant err-invalid-certificate-data (err u115))
+(define-constant err-certificate-expired (err u116))
+(define-constant err-certificate-revoked (err u117))
+(define-constant err-verifier-not-authorized (err u118))
+(define-constant err-template-not-found (err u119))
+
+(define-data-var next-certificate-id uint u1)
+(define-data-var next-template-id uint u1)
+(define-data-var next-verifier-id uint u1)
+
+(define-map certificate-templates uint
+  (tuple
+    (name (string-ascii 128))
+    (purpose (string-ascii 256))
+    (required-vaccines (list 10 (string-ascii 128)))
+    (validity-period-days uint)
+    (created-by principal)
+    (active bool)
+  ))
+
+(define-map vaccination-certificates uint
+  (tuple
+    (patient-hash (buff 32))
+    (template-id uint)
+    (verification-code (string-ascii 64))
+    (issued-date uint)
+    (expiry-date uint)
+    (issuer principal)
+    (status (string-ascii 32))
+    (verified-vaccines (list 10 (string-ascii 128)))
+  ))
+
+(define-map authorized-verifiers uint
+  (tuple
+    (organization-name (string-ascii 256))
+    (contact-person principal)
+    (verification-type (string-ascii 128))
+    (authorized-by principal)
+    (active bool)
+    (registered-date uint)
+  ))
+
+(define-map certificate-verifications (tuple (certificate-id uint) (verifier-id uint))
+  (tuple
+    (verification-date uint)
+    (result bool)
+    (notes (string-ascii 256))
+  ))
+
+(define-map patient-certificates (buff 32) (list 20 uint))
+(define-map revoked-certificates uint bool)
+
+(define-public (create-certificate-template
+  (name (string-ascii 128))
+  (purpose (string-ascii 256))
+  (required-vaccines (list 10 (string-ascii 128)))
+  (validity-period-days uint))
+  (let ((template-id (var-get next-template-id)))
+    (asserts! (or (is-eq tx-sender contract-owner)
+                  (default-to false (map-get? authorized-issuers tx-sender))) err-unauthorized-issuer)
+    (asserts! (> (len name) u0) err-invalid-certificate-data)
+    (asserts! (> (len purpose) u0) err-invalid-certificate-data)
+    (asserts! (> validity-period-days u0) err-invalid-certificate-data)
+    (map-set certificate-templates template-id
+      (tuple
+        (name name)
+        (purpose purpose)
+        (required-vaccines required-vaccines)
+        (validity-period-days validity-period-days)
+        (created-by tx-sender)
+        (active true)
+      ))
+    (var-set next-template-id (+ template-id u1))
+    (ok template-id)))
+
+(define-public (register-verifier
+  (organization-name (string-ascii 256))
+  (contact-person principal)
+  (verification-type (string-ascii 128)))
+  (let ((verifier-id (var-get next-verifier-id)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> (len organization-name) u0) err-invalid-certificate-data)
+    (asserts! (> (len verification-type) u0) err-invalid-certificate-data)
+    (map-set authorized-verifiers verifier-id
+      (tuple
+        (organization-name organization-name)
+        (contact-person contact-person)
+        (verification-type verification-type)
+        (authorized-by tx-sender)
+        (active true)
+        (registered-date stacks-block-height)
+      ))
+    (var-set next-verifier-id (+ verifier-id u1))
+    (ok verifier-id)))
+
+(define-public (issue-vaccination-certificate
+  (patient-id (string-ascii 64))
+  (template-id uint)
+  (verification-code (string-ascii 64)))
+  (let ((template (unwrap! (map-get? certificate-templates template-id) err-template-not-found))
+        (patient-record-list (default-to (list) (map-get? patient-records patient-id)))
+        (certificate-id (var-get next-certificate-id))
+        (patient-hash (keccak256 (concat (unwrap-panic (to-consensus-buff? patient-id)) (unwrap-panic (to-consensus-buff? stacks-block-height)))))
+        (current-certs (default-to (list) (map-get? patient-certificates patient-hash))))
+    (asserts! (or (is-eq tx-sender contract-owner)
+                  (default-to false (map-get? authorized-issuers tx-sender))) err-unauthorized-issuer)
+    (asserts! (get active template) err-template-not-found)
+    (asserts! (> (len verification-code) u0) err-invalid-certificate-data)
+    (let ((verified-vaccines (validate-patient-vaccines patient-record-list (get required-vaccines template)))
+          (expiry-date (+ stacks-block-height (get validity-period-days template))))
+      (asserts! (> (len verified-vaccines) u0) err-invalid-vaccine-data)
+      (map-set vaccination-certificates certificate-id
+        (tuple
+          (patient-hash patient-hash)
+          (template-id template-id)
+          (verification-code verification-code)
+          (issued-date stacks-block-height)
+          (expiry-date expiry-date)
+          (issuer tx-sender)
+          (status "active")
+          (verified-vaccines verified-vaccines)
+        ))
+      (map-set patient-certificates patient-hash
+        (unwrap! (as-max-len? (append current-certs certificate-id) u20) err-invalid-certificate-data))
+      (var-set next-certificate-id (+ certificate-id u1))
+      (ok certificate-id))))
+
+(define-public (verify-certificate
+  (certificate-id uint)
+  (verifier-id uint))
+  (let ((certificate (unwrap! (map-get? vaccination-certificates certificate-id) err-certificate-not-found))
+        (verifier (unwrap! (map-get? authorized-verifiers verifier-id) err-verifier-not-authorized)))
+    (asserts! (get active verifier) err-verifier-not-authorized)
+    (asserts! (not (default-to false (map-get? revoked-certificates certificate-id))) err-certificate-revoked)
+    (asserts! (< stacks-block-height (get expiry-date certificate)) err-certificate-expired)
+    (asserts! (is-eq (get status certificate) "active") err-certificate-revoked)
+    (let ((verification-result (tuple
+           (certificate-valid true)
+           (expiry-date (get expiry-date certificate))
+           (verified-vaccines (get verified-vaccines certificate))
+           (template-id (get template-id certificate)))))
+      (map-set certificate-verifications (tuple (certificate-id certificate-id) (verifier-id verifier-id))
+        (tuple
+          (verification-date stacks-block-height)
+          (result true)
+          (notes "Certificate verified successfully")
+        ))
+      (ok verification-result))))
+
+(define-public (revoke-certificate
+  (certificate-id uint)
+  (reason (string-ascii 256)))
+  (let ((certificate (unwrap! (map-get? vaccination-certificates certificate-id) err-certificate-not-found)))
+    (asserts! (or (is-eq tx-sender contract-owner)
+                  (is-eq tx-sender (get issuer certificate))) err-owner-only)
+    (map-set vaccination-certificates certificate-id
+      (merge certificate (tuple (status "revoked"))))
+    (map-set revoked-certificates certificate-id true)
+    (ok true)))
+
+(define-public (update-verifier-status
+  (verifier-id uint)
+  (active bool))
+  (let ((verifier (unwrap! (map-get? authorized-verifiers verifier-id) err-verifier-not-authorized)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set authorized-verifiers verifier-id
+      (merge verifier (tuple (active active))))
+    (ok true)))
+
+(define-public (batch-verify-certificates
+  (certificate-ids (list 10 uint))
+  (verifier-id uint))
+  (let ((verifier (unwrap! (map-get? authorized-verifiers verifier-id) err-verifier-not-authorized)))
+    (asserts! (get active verifier) err-verifier-not-authorized)
+    (ok (map verify-single-certificate certificate-ids))))
+
+(define-private (verify-single-certificate (certificate-id uint))
+  (match (map-get? vaccination-certificates certificate-id)
+    certificate (let ((is-revoked (default-to false (map-get? revoked-certificates certificate-id)))
+                      (is-expired (>= stacks-block-height (get expiry-date certificate)))
+                      (is-active (is-eq (get status certificate) "active")))
+                  (tuple
+                    (certificate-id certificate-id)
+                    (valid (and (not is-revoked) (not is-expired) is-active))
+                    (expiry-date (get expiry-date certificate))
+                    (status (get status certificate))
+                  ))
+    (tuple (certificate-id certificate-id) (valid false) (expiry-date u0) (status "not-found"))))
+
+(define-private (validate-patient-vaccines 
+  (patient-record-ids (list 50 uint)) 
+  (required-vaccines (list 10 (string-ascii 128))))
+  (fold check-required-vaccine required-vaccines (list)))
+
+(define-private (check-required-vaccine 
+  (required-vaccine (string-ascii 128)) 
+  (verified-vaccines (list 10 (string-ascii 128))))
+  (if (has-vaccine-record required-vaccine)
+    (unwrap! (as-max-len? (append verified-vaccines required-vaccine) u10) verified-vaccines)
+    verified-vaccines))
+
+(define-private (has-vaccine-record (vaccine-name (string-ascii 128)))
+  true)
+
+(define-read-only (get-certificate-template (template-id uint))
+  (map-get? certificate-templates template-id))
+
+(define-read-only (get-vaccination-certificate (certificate-id uint))
+  (map-get? vaccination-certificates certificate-id))
+
+(define-read-only (get-authorized-verifier (verifier-id uint))
+  (map-get? authorized-verifiers verifier-id))
+
+(define-read-only (get-patient-certificates (patient-hash (buff 32)))
+  (map-get? patient-certificates patient-hash))
+
+(define-read-only (is-certificate-valid (certificate-id uint))
+  (match (map-get? vaccination-certificates certificate-id)
+    certificate (let ((is-revoked (default-to false (map-get? revoked-certificates certificate-id)))
+                      (is-expired (>= stacks-block-height (get expiry-date certificate)))
+                      (is-active (is-eq (get status certificate) "active")))
+                  (ok (and (not is-revoked) (not is-expired) is-active)))
+    err-certificate-not-found))
+
+(define-read-only (get-verification-history (certificate-id uint))
+  (let ((verification-keys (list
+    (tuple (certificate-id certificate-id) (verifier-id u1))
+    (tuple (certificate-id certificate-id) (verifier-id u2))
+    (tuple (certificate-id certificate-id) (verifier-id u3))
+    (tuple (certificate-id certificate-id) (verifier-id u4))
+    (tuple (certificate-id certificate-id) (verifier-id u5)))))
+    (map get-single-verification verification-keys)))
+
+(define-private (get-single-verification (key (tuple (certificate-id uint) (verifier-id uint))))
+  (map-get? certificate-verifications key))
+
+(define-read-only (get-certificate-by-verification-code (verification-code (string-ascii 64)))
+  (let ((all-certs (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+    (filter match-verification-code (map get-vaccination-certificate all-certs))))
+
+(define-private (match-verification-code (cert-opt (optional (tuple 
+  (patient-hash (buff 32))
+  (template-id uint)
+  (verification-code (string-ascii 64))
+  (issued-date uint)
+  (expiry-date uint)
+  (issuer principal)
+  (status (string-ascii 32))
+  (verified-vaccines (list 10 (string-ascii 128)))))))
+  (match cert-opt
+    cert true
+    false))
+
+(define-read-only (get-active-certificates-count)
+  (ok (var-get next-certificate-id)))
+
+(define-read-only (get-template-statistics (template-id uint))
+  (ok (tuple
+    (template-id template-id)
+    (total-issued u0)
+    (active-certificates u0)
+    (revoked-certificates u0)
+  )))
+
+
+
+  
